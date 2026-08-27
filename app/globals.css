@@ -1,0 +1,214 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * Design tokens.
+ *
+ * Every colour in the app resolves through these HSL variables, so light and
+ * dark mode differ by this block alone — no component ever hard-codes a colour.
+ */
+@layer base {
+  :root {
+    --background: 210 40% 98%;
+    --foreground: 222 47% 11%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+
+    --primary: 243 75% 59%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 214 32% 95%;
+    --secondary-foreground: 222 47% 20%;
+
+    --muted: 214 32% 95%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 243 75% 96%;
+    --accent-foreground: 243 75% 40%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 152 69% 36%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 32 95% 44%;
+    --warning-foreground: 0 0% 100%;
+
+    --border: 214 32% 89%;
+    --input: 214 32% 89%;
+    --ring: 243 75% 59%;
+
+    --radius: 0.75rem;
+
+    /* Glass surfaces — tuned separately per theme so blur reads correctly. */
+    --glass: 0 0% 100% / 0.72;
+    --glass-border: 222 47% 11% / 0.08;
+  }
+
+  .dark {
+    --background: 222 47% 7%;
+    --foreground: 210 40% 96%;
+
+    --card: 222 40% 11%;
+    --card-foreground: 210 40% 96%;
+
+    --popover: 222 40% 11%;
+    --popover-foreground: 210 40% 96%;
+
+    --primary: 243 90% 70%;
+    --primary-foreground: 222 47% 8%;
+
+    --secondary: 222 30% 17%;
+    --secondary-foreground: 210 40% 92%;
+
+    --muted: 222 30% 17%;
+    --muted-foreground: 215 20% 65%;
+
+    --accent: 243 40% 22%;
+    --accent-foreground: 243 90% 85%;
+
+    --destructive: 0 72% 58%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 152 60% 45%;
+    --success-foreground: 222 47% 8%;
+
+    --warning: 32 90% 55%;
+    --warning-foreground: 222 47% 8%;
+
+    --border: 222 25% 20%;
+    --input: 222 25% 22%;
+    --ring: 243 90% 70%;
+
+    --glass: 222 40% 13% / 0.7;
+    --glass-border: 210 40% 96% / 0.08;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: 'cv11', 'ss01';
+    /* No horizontal scroll, ever — a hard requirement of the responsive spec. */
+    overflow-x: hidden;
+  }
+
+  /* Respect users who ask the OS to reduce motion: kill all animation. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  ::selection {
+    @apply bg-primary/25;
+  }
+
+  /* Slim, theme-aware scrollbars. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.35) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--muted-foreground) / 0.3);
+    border-radius: 9999px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground) / 0.5);
+  }
+
+  /* Consistent focus ring on keyboard navigation only. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+@layer components {
+  /* Frosted panel used by cards, the sidebar and every modal. */
+  .glass {
+    background-color: hsl(var(--glass));
+    border: 1px solid hsl(var(--glass-border));
+    backdrop-filter: blur(16px) saturate(160%);
+    -webkit-backdrop-filter: blur(16px) saturate(160%);
+  }
+
+  /* Ambient gradient wash behind the auth screens and the app shell. */
+  .aurora {
+    background-image:
+      radial-gradient(60% 55% at 12% 8%, hsl(243 75% 59% / 0.22) 0%, transparent 60%),
+      radial-gradient(45% 45% at 92% 12%, hsl(280 80% 60% / 0.18) 0%, transparent 60%),
+      radial-gradient(55% 50% at 78% 92%, hsl(199 89% 55% / 0.16) 0%, transparent 60%);
+  }
+
+  .grid-bg {
+    @apply bg-grid-light dark:bg-grid-dark;
+    background-size: 44px 44px;
+    mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 40%, transparent 100%);
+    -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, #000 40%, transparent 100%);
+  }
+
+  /* Text treatment for page titles. */
+  .text-gradient {
+    @apply bg-gradient-to-br from-foreground via-foreground to-foreground/55 bg-clip-text text-transparent;
+  }
+
+  /* Masked credential display. Tabular figures keep the dots from jittering. */
+  .credential {
+    @apply font-mono text-sm tracking-wide;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Loading placeholder with a sweeping highlight. */
+  .skeleton {
+    @apply relative overflow-hidden rounded-md bg-muted;
+  }
+
+  .skeleton::after {
+    @apply absolute inset-0 -translate-x-full animate-shimmer bg-gradient-to-r from-transparent via-foreground/10 to-transparent;
+    content: '';
+  }
+}
+
+@layer utilities {
+  /* Hide content visually but keep it for screen readers. */
+  .sr-only-focusable:not(:focus):not(:focus-within) {
+    @apply sr-only;
+  }
+
+  /* Tables that must scroll on small screens rather than widen the page. */
+  .table-scroll {
+    @apply -mx-4 overflow-x-auto px-4 sm:mx-0 sm:px-0;
+  }
+}
