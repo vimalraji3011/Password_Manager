@@ -2,7 +2,7 @@
 const nextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
-  serverExternalPackages: ['bcryptjs', 'nodemailer'],
+  serverExternalPackages: ['bcryptjs', 'nodemailer', 'pg'],
   async headers() {
     return [
       {

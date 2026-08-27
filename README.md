@@ -1,8 +1,11 @@
 # Office Password Management
 
 An internal credential vault for organization passwords. Next.js 15 (App Router),
-TypeScript, Tailwind CSS, shadcn/ui-style components, Framer Motion — with a
-JSON-file datastore and no database.
+TypeScript, Tailwind CSS, shadcn/ui-style components, Framer Motion.
+
+Runs on a JSON-file datastore with no database at all, or on Postgres when the
+host has no persistent disk (Vercel). Same code, same API — see
+[Storage](#storage).
 
 ---
 
@@ -139,10 +142,12 @@ data/
 ├── organizations.json    organizations
 ├── sources.json          credentials (AES-256-GCM envelopes)
 ├── audit.json            append-only audit trail (capped at 5,000 entries)
-└── reset-requests.json   OTP + approval state
+├── reset-requests.json   OTP + approval state
+└── rate-limits.json      throttling buckets (shared driver only)
 ```
 
-`lib/json-storage.ts` provides the whole persistence layer:
+`lib/json-storage.ts` is the API the app uses; the mechanism lives in
+`lib/storage/`. The filesystem driver guarantees:
 
 - **Atomic writes.** Data goes to a temp file in the same directory, is `fsync`ed,
   then `rename()`d over the target. `rename` is atomic on NTFS and POSIX, so a
@@ -156,9 +161,35 @@ data/
 `data/*.json` is **gitignored** — it holds bcrypt hashes and encrypted
 credentials and must never be committed.
 
+### Two drivers
+
+The persistence layer sits behind a driver interface in [`lib/storage/`](lib/storage/),
+so the same `Collection<T>` API works against either backend and nothing above
+it knows which is active:
+
+| | `filesystem` | `postgres` |
+| --- | --- | --- |
+| Stores | JSON files in `data/` | `jsonb` rows in one table |
+| Atomicity | temp file + `fsync` + `rename` | optimistic concurrency (`version` column) |
+| Cross-instance safe | ❌ in-process lock only | ✅ |
+| Use for | local dev, VMs, containers with a disk | Vercel, serverless, multiple replicas |
+
+Selection is automatic: Postgres when a connection string is present, filesystem
+otherwise. `STORAGE_DRIVER=filesystem|postgres` overrides. On a serverless host
+with no connection string the app **refuses to start** rather than failing on the
+first write, which would look like a broken login instead of a misconfiguration.
+
+Appends (`Collection.insert`) get a dedicated code path rather than being built
+from read-modify-write. Under Postgres it is a single statement that concatenates
+onto the `jsonb` array and derives `id` as `MAX(id) + 1`, all under the UPDATE's
+own row lock. That matters: the audit log takes a write on every audited event, and
+with read-modify-write a burst of N concurrent writers each have a 1/N chance of
+winning a round — enough to exhaust any retry budget. `npm run verify:postgres`
+runs 250 concurrent appends and asserts a dense, gap-free `1..250` id sequence.
+
 The `Collection<T>` API (`all`, `byId`, `insert`, `update`, `remove`,
-`removeWhere`) is shaped like a repository so a future SQL migration can replace
-the implementation without touching callers.
+`removeWhere`) is shaped like a repository, so moving to per-entity SQL tables
+stays local to `lib/storage/`.
 
 ---
 
@@ -250,24 +281,87 @@ scripts/         seed.mjs, genkey.mjs
 | `npm run lint` | ESLint |
 | `npm run seed` | Bootstrap `data/`. `-- --force` to recreate, `-- --no-demo` for accounts only |
 | `npm run genkey` | Generate `JWT_SECRET` and `MASTER_ENCRYPTION_KEY` |
+| `npm run verify:postgres` | Run the Postgres storage layer against real Postgres (PGlite/WASM) — 26 assertions, no database needed |
 
 ---
 
-## Deployment notes
+## Deploying to Vercel
 
-The JSON datastore is a real constraint, and an intentional one:
+Vercel's filesystem is read-only and ephemeral, so the vault needs Postgres. The
+app detects this and switches drivers on its own — you only have to provision a
+database and seed it.
 
-- **Single instance only.** Atomic writes protect against a crash, not against
-  two processes writing the same file. Do not run multiple replicas.
-- **Persistent disk required.** `data/` must survive restarts, which rules out
-  ephemeral filesystems (Vercel's included). A small VM or container with a
-  mounted volume is the right shape.
-- **Rate limiting is process-local.** `lib/rate-limit.ts` uses an in-memory Map;
-  horizontal scaling would need Redis behind the same interface.
-- **HTTPS.** Session cookies set `secure` in production, so the app must be
-  served over TLS or nobody will be able to sign in.
+**1. Provision Postgres.** In the Vercel dashboard: *Storage → Create Database →
+Postgres*. That sets `POSTGRES_URL` for you. Neon, Supabase and Railway work
+equally well — set `DATABASE_URL` instead. Use the **pooled** connection string
+(Neon's `-pooler` host, Supabase's pgBouncer port): the driver keeps one
+connection per instance, and a serverless platform may run many instances.
+
+**2. Set the environment variables.**
+
+| Variable | Value | Notes |
+| --- | --- | --- |
+| `JWT_SECRET` | from `npm run genkey` | rotating it signs everyone out |
+| `MASTER_ENCRYPTION_KEY` | from `npm run genkey` | **back this up** |
+| `APP_URL` | `https://your-app.vercel.app` | builds the links in reset emails |
+| `DATABASE_URL` | pooled connection string | not needed if `POSTGRES_URL` is set |
+| `SMTP_HOST` | `smtp-relay.brevo.com` | |
+| `SMTP_PORT` | `587` | |
+| `SMTP_USER` | your Brevo login | |
+| `SMTP_PASS` | your Brevo SMTP key | |
+| `FROM_EMAIL` | `no-reply@yourcompany.com` | must be verified in Brevo |
+| `FROM_NAME` | `Office Password Manager` | |
+| `EMAIL_DEV_MODE` | `false` | otherwise OTPs only print to the log |
+
+Optional: `JWT_EXPIRY_SECONDS` (default `28800`), `STORAGE_DRIVER` (auto-detected).
+
+**Do not set the eight `SEED_*` variables.** They are read only by
+`scripts/seed.mjs`, which never runs in production — adding them would park a
+plaintext password in your dashboard for no benefit.
+
+**3. Seed the database.** Run the seed locally against the production database;
+it writes the same rows the deployed app reads:
+
+```bash
+# bash / zsh
+DATABASE_URL='<your pooled connection string>' npm run seed
+
+# PowerShell
+$env:DATABASE_URL='<your pooled connection string>'; npm run seed
+```
+
+It creates the table if needed and refuses to overwrite existing accounts unless
+you pass `-- --force`.
+
+**4. Sign in and rotate.** Change both seeded passwords immediately. The dashboard
+shows a **Postgres storage** badge, which is how you confirm the right driver went
+live.
+
+### Caveats on serverless
+
+- **Back up `MASTER_ENCRYPTION_KEY` outside Vercel.** It is the only thing that
+  can decrypt the vault, and it is not stored in the database.
+- **Cold starts** add latency to the first request while the pool connects.
+- **The audit log is one `jsonb` row**, capped at 5,000 entries and rewritten on
+  each append. Fine at this scale; if you need more history, promote it to its own
+  table — the change is contained to `lib/storage/`.
 
 ---
+
+## Deploying with a disk (VM, container, Railway, Render, Fly.io)
+
+The filesystem driver is simpler and needs no database. Requirements:
+
+- **Persistent volume** mounted so `data/` survives restarts.
+- **Single instance.** Atomic writes protect against a crash, not against two
+  processes writing the same file. Use Postgres if you need replicas.
+- **HTTPS.** Session cookies set `secure` in production, so over plain HTTP
+  nobody can sign in.
+
+Rate limiting follows the driver: an in-memory Map under `filesystem` (correct for
+one process) and the shared datastore under `postgres`. That second part matters —
+per-instance counters would turn "5 attempts per 5 minutes" into 5 attempts *per
+instance*, which is not a rate limit at all.
 
 ## Built for migration
 

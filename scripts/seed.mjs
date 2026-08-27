@@ -5,23 +5,43 @@ import { createCipheriv, randomBytes } from 'node:crypto';
 import bcrypt from 'bcryptjs';
 
 /**
- * Bootstraps `data/` with the two accounts the app ships with and a small set
- * of demo organizations and credentials.
+ * Bootstraps the datastore with the two accounts the app ships with and a small
+ * set of demo organizations and credentials.
  *
- * Safe to run repeatedly: it refuses to overwrite an existing users.json unless
- * `--force` is passed, so a real vault can never be wiped by a stray `npm run
- * seed`.
+ * Writes to whichever backend the app itself would use:
+ *   - Postgres, when DATABASE_URL / POSTGRES_URL is set (or --postgres is passed)
+ *   - JSON files under ./data otherwise
+ *
+ * That is what makes seeding a Vercel deployment possible: run this locally with
+ * the production DATABASE_URL exported, and it populates the same rows the
+ * deployed app reads.
+ *
+ * Safe to run repeatedly: it refuses to overwrite existing users unless
+ * `--force` is passed, so a real vault can never be wiped by a stray seed.
  *
  * Usage:
  *   npm run seed
- *   npm run seed -- --force        (recreate everything from scratch)
- *   npm run seed -- --no-demo      (accounts only, empty vault)
+ *   npm run seed -- --force        recreate everything from scratch
+ *   npm run seed -- --no-demo      accounts only, empty vault
+ *   npm run seed -- --postgres     force the Postgres target
  */
 
 const ROOT = process.cwd();
 const DATA_DIR = path.join(ROOT, 'data');
 const FORCE = process.argv.includes('--force');
 const NO_DEMO = process.argv.includes('--no-demo');
+const FORCE_PG = process.argv.includes('--postgres');
+
+const TABLE = 'opm_documents';
+
+const KEYS = {
+  users: 'users.json',
+  organizations: 'organizations.json',
+  sources: 'sources.json',
+  audit: 'audit.json',
+  resetRequests: 'reset-requests.json',
+  rateLimits: 'rate-limits.json',
+};
 
 /* -------------------------------------------------------------- *
  * Minimal .env loader — the script runs outside the Next.js
@@ -39,10 +59,20 @@ async function loadEnv() {
       const match = /^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/i.exec(line);
       if (!match) continue;
       const [, key, rawValue] = match;
-      if (process.env[key] !== undefined) continue; // first file wins
+      if (process.env[key] !== undefined) continue; // first file (and real env) wins
       process.env[key] = rawValue.replace(/^["']|["']$/g, '');
     }
   }
+}
+
+function postgresUrl() {
+  return (
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.POSTGRES_PRISMA_URL ||
+    process.env.POSTGRES_URL_NON_POOLING ||
+    null
+  );
 }
 
 function getMasterKey() {
@@ -75,82 +105,166 @@ function encrypt(plaintext, key) {
   };
 }
 
-async function writeFileAtomic(name, value) {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  const target = path.join(DATA_DIR, name);
-  const tmp = `${target}.${randomBytes(4).toString('hex')}.tmp`;
-  await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  await fs.rename(tmp, target);
+/* -------------------------------------------------------------- *
+ * Targets — each exposes the same read/write pair, so the seeding
+ * logic below does not care where the data lands.
+ * -------------------------------------------------------------- */
+
+function filesystemTarget() {
+  return {
+    label: `JSON files in ${path.relative(ROOT, DATA_DIR) || 'data'}/`,
+
+    async read(key) {
+      try {
+        return JSON.parse(await fs.readFile(path.join(DATA_DIR, key), 'utf8'));
+      } catch {
+        return null;
+      }
+    },
+
+    async write(key, value) {
+      await fs.mkdir(DATA_DIR, { recursive: true });
+      const target = path.join(DATA_DIR, key);
+      const tmp = `${target}.${randomBytes(4).toString('hex')}.tmp`;
+      await fs.writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+      await fs.rename(tmp, target);
+    },
+
+    async close() {},
+  };
 }
 
-async function exists(name) {
-  try {
-    await fs.access(path.join(DATA_DIR, name));
-    return true;
-  } catch {
-    return false;
-  }
+async function postgresTarget(url) {
+  // Imported lazily so a filesystem-only setup never needs `pg` resolved.
+  const { default: pg } = await import('pg');
+
+  const client = new pg.Client({
+    connectionString: url,
+    ssl: /\bsslmode=disable\b/.test(url) ? false : { rejectUnauthorized: false },
+  });
+
+  await client.connect();
+
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS ${TABLE} (
+      key        text PRIMARY KEY,
+      value      jsonb NOT NULL,
+      version    bigint NOT NULL DEFAULT 1,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    )
+  `);
+
+  // Redact credentials before echoing the destination back to the operator.
+  const safeHost = (() => {
+    try {
+      const parsed = new URL(url);
+      return `${parsed.host}${parsed.pathname}`;
+    } catch {
+      return 'the configured database';
+    }
+  })();
+
+  return {
+    label: `Postgres at ${safeHost}`,
+
+    async read(key) {
+      const result = await client.query(`SELECT value FROM ${TABLE} WHERE key = $1`, [key]);
+      return result.rows.length > 0 ? result.rows[0].value : null;
+    },
+
+    async write(key, value) {
+      await client.query(
+        `INSERT INTO ${TABLE} (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE
+           SET value = EXCLUDED.value,
+               version = ${TABLE}.version + 1,
+               updated_at = now()`,
+        [key, JSON.stringify(value)],
+      );
+    },
+
+    async close() {
+      await client.end();
+    },
+  };
 }
+
+async function resolveTarget() {
+  const url = postgresUrl();
+  if (FORCE_PG && !url) {
+    console.error('\n--postgres was passed but no DATABASE_URL / POSTGRES_URL is set.\n');
+    process.exit(1);
+  }
+  return url ? postgresTarget(url) : filesystemTarget();
+}
+
+/* -------------------------------------------------------------- *
+ * Seeding
+ * -------------------------------------------------------------- */
 
 async function main() {
   await loadEnv();
   const key = getMasterKey();
+  const target = await resolveTarget();
 
-  if ((await exists('users.json')) && !FORCE) {
-    console.log(
-      '\ndata/users.json already exists — nothing was changed.\n' +
-        'Pass --force to wipe and recreate the datastore:  npm run seed -- --force\n',
-    );
-    return;
-  }
+  try {
+    const existing = await target.read(KEYS.users);
 
-  const now = new Date().toISOString();
+    if (Array.isArray(existing) && existing.length > 0 && !FORCE) {
+      console.log(
+        `\n${target.label} already holds ${existing.length} account(s) — nothing was changed.\n` +
+          'Pass --force to wipe and recreate the datastore:  npm run seed -- --force\n',
+      );
+      return;
+    }
 
-  const accounts = [
-    {
-      role: 'admin',
-      name: process.env.SEED_ADMIN_NAME || 'System Admin',
-      email: (process.env.SEED_ADMIN_EMAIL || 'admin@company.com').toLowerCase(),
-      mobile: process.env.SEED_ADMIN_MOBILE || '9876543210',
-      password: process.env.SEED_ADMIN_PASSWORD || 'Admin@12345',
-    },
-    {
-      role: 'viewer',
-      name: process.env.SEED_VIEWER_NAME || 'Viewer',
-      email: (process.env.SEED_VIEWER_EMAIL || 'viewer@company.com').toLowerCase(),
-      mobile: process.env.SEED_VIEWER_MOBILE || '9876543211',
-      password: process.env.SEED_VIEWER_PASSWORD || 'Viewer@12345',
-    },
-  ];
+    const now = new Date().toISOString();
 
-  const users = [];
-  for (const [index, account] of accounts.entries()) {
-    users.push({
-      id: index + 1,
-      name: account.name,
-      email: account.email,
-      mobile: account.mobile,
-      passwordHash: await bcrypt.hash(account.password, 12),
-      role: account.role,
-      lastLogin: null,
-      createdAt: now,
-      updatedAt: now,
-    });
-  }
+    const accounts = [
+      {
+        role: 'admin',
+        name: process.env.SEED_ADMIN_NAME || 'System Admin',
+        email: (process.env.SEED_ADMIN_EMAIL || 'admin@company.com').toLowerCase(),
+        mobile: process.env.SEED_ADMIN_MOBILE || '9876543210',
+        password: process.env.SEED_ADMIN_PASSWORD || 'Admin@12345',
+      },
+      {
+        role: 'viewer',
+        name: process.env.SEED_VIEWER_NAME || 'Viewer',
+        email: (process.env.SEED_VIEWER_EMAIL || 'viewer@company.com').toLowerCase(),
+        mobile: process.env.SEED_VIEWER_MOBILE || '9876543211',
+        password: process.env.SEED_VIEWER_PASSWORD || 'Viewer@12345',
+      },
+    ];
 
-  await writeFileAtomic('users.json', users);
+    const users = [];
+    for (const [index, account] of accounts.entries()) {
+      users.push({
+        id: index + 1,
+        name: account.name,
+        email: account.email,
+        mobile: account.mobile,
+        passwordHash: await bcrypt.hash(account.password, 12),
+        role: account.role,
+        lastLogin: null,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
 
-  const demo = NO_DEMO
-    ? { organizations: [], sources: [] }
-    : buildDemoVault(users[0].name, now, key);
+    const demo = NO_DEMO
+      ? { organizations: [], sources: [] }
+      : buildDemoVault(users[0].name, now, key);
 
-  await writeFileAtomic('organizations.json', demo.organizations);
-  await writeFileAtomic('sources.json', demo.sources);
-  await writeFileAtomic('audit.json', []);
-  await writeFileAtomic('reset-requests.json', []);
+    await target.write(KEYS.users, users);
+    await target.write(KEYS.organizations, demo.organizations);
+    await target.write(KEYS.sources, demo.sources);
+    await target.write(KEYS.audit, []);
+    await target.write(KEYS.resetRequests, []);
+    await target.write(KEYS.rateLimits, {});
 
-  console.log(`
-Datastore created in ./data
+    console.log(`
+Datastore ready — ${target.label}
 
   Admin   ${accounts[0].email}   ${accounts[0].password}
   Viewer  ${accounts[1].email}   ${accounts[1].password}
@@ -160,6 +274,9 @@ Datastore created in ./data
 
 Change both passwords after the first sign-in.
 `);
+  } finally {
+    await target.close();
+  }
 }
 
 function buildDemoVault(actor, now, key) {

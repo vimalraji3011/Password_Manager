@@ -21,7 +21,7 @@ import { fieldErrors, forgotPasswordSchema } from '@/lib/validation';
 export const POST = withPublic(async (request) => {
   const ip = clientIp(request);
 
-  const limit = rateLimit({ key: `otp:request:${ip}`, ...LIMITS.otpRequest });
+  const limit = await rateLimit({ key: `otp:request:${ip}`, ...LIMITS.otpRequest });
   if (!limit.allowed) {
     return fail(
       `Too many reset requests. Try again in ${Math.ceil(limit.retryAfter / 60)} minute(s).`,

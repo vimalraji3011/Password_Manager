@@ -37,7 +37,7 @@ const completeSchema = z
 export const POST = withPublic(async (request) => {
   const ip = clientIp(request);
 
-  const limit = rateLimit({ key: `view-reset:${ip}`, ...LIMITS.otpVerify });
+  const limit = await rateLimit({ key: `view-reset:${ip}`, ...LIMITS.otpVerify });
   if (!limit.allowed) {
     return fail(
       `Too many attempts. Try again in ${Math.ceil(limit.retryAfter / 60)} minute(s).`,

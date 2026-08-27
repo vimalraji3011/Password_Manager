@@ -6,6 +6,8 @@ import {
   Clock3,
   Eye,
   KeyRound,
+  Database,
+  HardDrive,
   Plus,
   ScrollText,
   ShieldAlert,
@@ -19,6 +21,7 @@ import { StatCard } from '@/components/dashboard/stat-card';
 import { ACTION_META, listAudit } from '@/lib/audit';
 import { getCurrentUser } from '@/lib/auth';
 import { getDashboardStats, resetRequests } from '@/lib/repository';
+import { storageDriverName } from '@/lib/storage';
 import { MASKED_PASSWORD, formatDateTime, hostnameOf, relativeTime } from '@/lib/utils';
 
 export const metadata: Metadata = { title: 'Dashboard' };
@@ -34,6 +37,10 @@ export const metadata: Metadata = { title: 'Dashboard' };
 export default async function DashboardPage() {
   const user = await getCurrentUser();
   const isAdmin = user?.role === 'admin';
+
+  // Operators need to see which backend is live: a Vercel deployment that
+  // silently fell back to the wrong driver would be a data-loss bug.
+  const driver = storageDriverName();
 
   const [stats, recentAudit, pendingRequests] = await Promise.all([
     getDashboardStats(),
@@ -69,6 +76,16 @@ export default async function DashboardPage() {
           ) : null
         }
       />
+
+      {isAdmin ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant={driver === 'postgres' ? 'info' : 'neutral'}>
+            {driver === 'postgres' ? <Database /> : <HardDrive />}
+            {driver === 'postgres' ? 'Postgres storage' : 'Local JSON storage'}
+          </Badge>
+          <Badge variant="success">AES-256-GCM at rest</Badge>
+        </div>
+      ) : null}
 
       {/* Pending approvals need to be impossible to miss. */}
       {isAdmin && pendingRequests.length > 0 ? (

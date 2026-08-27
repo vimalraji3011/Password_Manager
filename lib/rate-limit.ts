@@ -1,12 +1,22 @@
 import 'server-only';
+import { FILES, updateJson } from '@/lib/json-storage';
+import { getStorageDriver } from '@/lib/storage';
 
 /**
- * In-memory sliding-window rate limiter.
+ * Sliding-window rate limiter with two backends.
  *
- * Deliberately process-local: this app has no database and runs as a single
- * Node process, so a Map is the right amount of machinery. If the app is ever
- * scaled horizontally this must move to Redis — the interface below is the only
- * thing callers depend on, so that swap stays local to this file.
+ * **In-memory** when the filesystem driver is active: a single Node process owns
+ * all traffic, so a Map is exactly the right amount of machinery.
+ *
+ * **Shared, via the datastore** when the Postgres driver is active. This matters
+ * more than it looks: on a serverless host each instance would otherwise keep
+ * its own counters, so "5 login attempts per 5 minutes" silently becomes 5 *per
+ * instance* — and an attacker who reconnects enough times gets as many attempts
+ * as they like. A rate limit that scales with the attacker's patience is not a
+ * rate limit, so it moves into shared storage where the driver is distributed.
+ *
+ * Write volume is trivial (a handful of rows on failed auth attempts), and the
+ * successful path clears the bucket, so honest users cost nothing.
  */
 
 interface Window {
@@ -14,15 +24,27 @@ interface Window {
   blockedUntil?: number;
 }
 
-const buckets = new Map<string, Window>();
+type Buckets = Record<string, Window>;
+
+const memory = new Map<string, Window>();
 
 /** Drop stale buckets so a long-running process cannot leak memory. */
-function sweep(now: number) {
-  if (buckets.size < 512) return;
-  for (const [key, window] of buckets) {
+function sweepMemory(now: number) {
+  if (memory.size < 512) return;
+  for (const [key, window] of memory) {
     const fresh = window.hits.some((t) => now - t < 3_600_000);
-    if (!fresh && (!window.blockedUntil || window.blockedUntil < now)) buckets.delete(key);
+    if (!fresh && (!window.blockedUntil || window.blockedUntil < now)) memory.delete(key);
   }
+}
+
+/** Same pruning for the shared document, which has no process to bound it. */
+function sweepShared(buckets: Buckets, now: number): Buckets {
+  const kept: Buckets = {};
+  for (const [key, window] of Object.entries(buckets)) {
+    const fresh = window.hits.some((t) => now - t < 3_600_000);
+    if (fresh || (window.blockedUntil && window.blockedUntil > now)) kept[key] = window;
+  }
+  return kept;
 }
 
 export interface RateLimitOptions {
@@ -43,43 +65,86 @@ export interface RateLimitResult {
   retryAfter: number;
 }
 
-export function rateLimit({
-  key,
-  limit,
-  windowMs,
-  blockMs = windowMs,
-}: RateLimitOptions): RateLimitResult {
-  const now = Date.now();
-  sweep(now);
+/**
+ * Pure decision function, shared by both backends so they cannot drift apart.
+ * Returns the verdict plus the window to persist.
+ */
+function evaluate(
+  window: Window | undefined,
+  now: number,
+  { limit, windowMs, blockMs }: Required<Omit<RateLimitOptions, 'key'>>,
+): { result: RateLimitResult; next: Window | null } {
+  const current: Window = window ?? { hits: [] };
 
-  const window = buckets.get(key) ?? { hits: [] };
-
-  if (window.blockedUntil && window.blockedUntil > now) {
+  if (current.blockedUntil && current.blockedUntil > now) {
     return {
-      allowed: false,
-      remaining: 0,
-      retryAfter: Math.ceil((window.blockedUntil - now) / 1000),
+      result: {
+        allowed: false,
+        remaining: 0,
+        retryAfter: Math.ceil((current.blockedUntil - now) / 1000),
+      },
+      // Nothing to write: the block is already recorded.
+      next: null,
     };
   }
 
-  window.hits = window.hits.filter((t) => now - t < windowMs);
+  const hits = current.hits.filter((t) => now - t < windowMs);
 
-  if (window.hits.length >= limit) {
-    window.blockedUntil = now + blockMs;
-    buckets.set(key, window);
-    return { allowed: false, remaining: 0, retryAfter: Math.ceil(blockMs / 1000) };
+  if (hits.length >= limit) {
+    return {
+      result: { allowed: false, remaining: 0, retryAfter: Math.ceil(blockMs / 1000) },
+      next: { hits, blockedUntil: now + blockMs },
+    };
   }
 
-  window.hits.push(now);
-  delete window.blockedUntil;
-  buckets.set(key, window);
+  return {
+    result: { allowed: true, remaining: limit - hits.length - 1, retryAfter: 0 },
+    next: { hits: [...hits, now] },
+  };
+}
 
-  return { allowed: true, remaining: limit - window.hits.length, retryAfter: 0 };
+export async function rateLimit(options: RateLimitOptions): Promise<RateLimitResult> {
+  const { key, limit, windowMs, blockMs = windowMs } = options;
+  const now = Date.now();
+  const config = { limit, windowMs, blockMs };
+
+  if (getStorageDriver().name === 'filesystem') {
+    sweepMemory(now);
+    const { result, next } = evaluate(memory.get(key), now, config);
+    if (next) memory.set(key, next);
+    return result;
+  }
+
+  // Shared path. The mutator is pure, so the driver may safely retry it.
+  return updateJson<Buckets, RateLimitResult>(
+    FILES.rateLimits,
+    {},
+    (buckets) => evaluate(buckets[key], now, config).result,
+    (buckets, _result) => {
+      const { next } = evaluate(buckets[key], now, config);
+      const pruned = sweepShared(buckets, now);
+      return next ? { ...pruned, [key]: next } : pruned;
+    },
+  );
 }
 
 /** Clear a bucket after a successful attempt so honest users are never locked out. */
-export function resetRateLimit(key: string): void {
-  buckets.delete(key);
+export async function resetRateLimit(key: string): Promise<void> {
+  if (getStorageDriver().name === 'filesystem') {
+    memory.delete(key);
+    return;
+  }
+
+  await updateJson<Buckets, void>(
+    FILES.rateLimits,
+    {},
+    () => undefined,
+    (buckets) => {
+      if (!(key in buckets)) return buckets;
+      const { [key]: _removed, ...rest } = buckets;
+      return rest;
+    },
+  );
 }
 
 /** Tuned limits for the sensitive endpoints. */

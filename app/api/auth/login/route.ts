@@ -28,7 +28,7 @@ import { fieldErrors, loginSchema } from '@/lib/validation';
 export const POST = withPublic(async (request) => {
   const ip = clientIp(request);
 
-  const ipLimit = rateLimit({ key: `login:ip:${ip}`, ...LIMITS.login });
+  const ipLimit = await rateLimit({ key: `login:ip:${ip}`, ...LIMITS.login });
   if (!ipLimit.allowed) {
     return fail(
       `Too many sign-in attempts. Try again in ${Math.ceil(ipLimit.retryAfter / 60)} minute(s).`,
@@ -44,7 +44,7 @@ export const POST = withPublic(async (request) => {
 
   const { email, password, remember } = parsed.data;
 
-  const emailLimit = rateLimit({ key: `login:email:${email}`, ...LIMITS.login });
+  const emailLimit = await rateLimit({ key: `login:email:${email}`, ...LIMITS.login });
   if (!emailLimit.allowed) {
     return fail(
       `Too many attempts for this account. Try again in ${Math.ceil(emailLimit.retryAfter / 60)} minute(s).`,
@@ -70,8 +70,8 @@ export const POST = withPublic(async (request) => {
 
   // Successful sign-in clears the counters so a legitimate user who fat-fingered
   // their password a few times is not left locked out.
-  resetRateLimit(`login:ip:${ip}`);
-  resetRateLimit(`login:email:${email}`);
+  await resetRateLimit(`login:ip:${ip}`);
+  await resetRateLimit(`login:email:${email}`);
 
   const now = new Date().toISOString();
   await users.update(user.id, { lastLogin: now, updatedAt: now });

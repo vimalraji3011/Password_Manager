@@ -53,7 +53,7 @@ export const POST = withAuthParams<
     const id = parseId(params.id);
     if (!id) return fail('Invalid source id.', 400);
 
-    const limit = rateLimit({ key: `reveal:${user.id}`, ...LIMITS.reveal });
+    const limit = await rateLimit({ key: `reveal:${user.id}`, ...LIMITS.reveal });
     if (!limit.allowed) {
       return fail(
         `Too many reveal attempts. Try again in ${Math.ceil(limit.retryAfter / 60)} minute(s).`,
@@ -94,7 +94,7 @@ export const POST = withAuthParams<
     const plaintext = decrypt(source.password);
 
     // A correct password clears the counter so normal use is never throttled.
-    resetRateLimit(`reveal:${user.id}`);
+    await resetRateLimit(`reveal:${user.id}`);
 
     await recordAudit({
       action: 'PASSWORD_VIEWED',

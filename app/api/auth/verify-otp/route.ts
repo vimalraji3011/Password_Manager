@@ -14,7 +14,7 @@ import { fieldErrors, verifyOtpSchema } from '@/lib/validation';
 export const POST = withPublic(async (request) => {
   const ip = clientIp(request);
 
-  const limit = rateLimit({ key: `otp:verify:${ip}`, ...LIMITS.otpVerify });
+  const limit = await rateLimit({ key: `otp:verify:${ip}`, ...LIMITS.otpVerify });
   if (!limit.allowed) {
     return fail(
       `Too many attempts. Try again in ${Math.ceil(limit.retryAfter / 60)} minute(s).`,
