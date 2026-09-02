@@ -35,3 +35,4 @@ yarn-error.log*
 # data. Never commit. Run `npm run seed` to bootstrap locally.
 # ---------------------------------------------------------------
 /data/*.json
+/data/*.corrupt-*
