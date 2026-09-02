@@ -1,11 +1,12 @@
 import { clientIp, fail, ok, readBody, userAgent, withPublic } from '@/lib/api';
 import { recordAudit } from '@/lib/audit';
+import { PASSWORD_KDF } from '@/lib/password-kdf';
 import { hashPassword, users } from '@/lib/auth';
 import { findRequestByToken } from '@/lib/reset-flow';
-import { LIMITS, rateLimit } from '@/lib/rate-limit';
+import { LIMITS, rateLimitIp } from '@/lib/rate-limit';
 import { resetRequests } from '@/lib/repository';
 import { z } from 'zod';
-import { fieldErrors } from '@/lib/validation';
+import { fieldErrors, passwordProof } from '@/lib/validation';
 
 /**
  * POST /api/reset-requests/complete
@@ -17,27 +18,16 @@ import { fieldErrors } from '@/lib/validation';
  * no session to authenticate with. The token *is* the authentication — hence the
  * rate limit, the short expiry, and the immediate invalidation below.
  */
-const completeSchema = z
-  .object({
-    token: z.string().trim().min(10, 'This link is not valid.'),
-    password: z
-      .string()
-      .min(8, 'Password must be at least 8 characters')
-      .max(128, 'Password must be 128 characters or fewer')
-      .regex(/[a-z]/, 'Include at least one lowercase letter')
-      .regex(/[A-Z]/, 'Include at least one uppercase letter')
-      .regex(/\d/, 'Include at least one number'),
-    confirmPassword: z.string(),
-  })
-  .refine((value) => value.password === value.confirmPassword, {
-    message: 'Passwords do not match',
-    path: ['confirmPassword'],
-  });
+const completeSchema = z.object({
+  token: z.string().trim().min(10, 'This link is not valid.'),
+  // Strength is checked in the browser before derivation; see lib/password-kdf.
+  password: passwordProof,
+});
 
 export const POST = withPublic(async (request) => {
   const ip = clientIp(request);
 
-  const limit = await rateLimit({ key: `view-reset:${ip}`, ...LIMITS.otpVerify });
+  const limit = await rateLimitIp(ip, 'view-reset', LIMITS.otpVerify);
   if (!limit.allowed) {
     return fail(
       `Too many attempts. Try again in ${Math.ceil(limit.retryAfter / 60)} minute(s).`,
@@ -61,7 +51,9 @@ export const POST = withPublic(async (request) => {
   if (!user) return fail('That account no longer exists.', 410);
 
   await users.update(user.id, {
+    // `password` is already the browser-derived proof; bcrypt goes on top.
     passwordHash: await hashPassword(password),
+    passwordKdf: PASSWORD_KDF,
     mustChangePassword: false,
     updatedAt: new Date().toISOString(),
   });

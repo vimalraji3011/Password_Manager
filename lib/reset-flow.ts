@@ -85,6 +85,41 @@ export async function verifyResetToken(options: {
   return { valid: true, request };
 }
 
+/**
+ * Read-only lookup of the address a token belongs to.
+ *
+ * The verify page needs it because the new password is derived under the user's
+ * email as salt, and the browser has no other way to learn which address the
+ * link is for. Taking it from the token rather than from a query parameter is
+ * the point: an email a visitor could edit would let them derive under the wrong
+ * salt and silently lock the account out of its own new password.
+ *
+ * Deliberately does not expire anything it finds — this runs during a page
+ * render, which should not mutate state. `findRequestByToken` still does the
+ * authoritative, side-effecting check when the form is submitted.
+ */
+export async function findEmailByToken(
+  kind: ResetRequestKind,
+  token: string,
+): Promise<string | null> {
+  if (!token) return null;
+
+  const hash = hashToken(token);
+  const all = await resetRequests.all();
+
+  const match = all.find(
+    (item) =>
+      item.kind === kind &&
+      item.tokenHash != null &&
+      safeCompare(hash, item.tokenHash) &&
+      (item.status === 'PENDING' || item.status === 'APPROVED'),
+  );
+
+  if (!match) return null;
+  if (match.expiresAt && new Date(match.expiresAt).getTime() < Date.now()) return null;
+  return match.userEmail;
+}
+
 /** Find a pending/approved request by its one-time token, across all users. */
 export async function findRequestByToken(
   kind: ResetRequestKind,

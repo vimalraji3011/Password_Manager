@@ -1,4 +1,5 @@
 import 'server-only';
+import { hasReliableIp } from '@/lib/api';
 import { FILES, updateJson } from '@/lib/json-storage';
 import { getStorageDriver } from '@/lib/storage';
 
@@ -147,10 +148,32 @@ export async function resetRateLimit(key: string): Promise<void> {
   );
 }
 
+/**
+ * Per-IP limiting that degrades honestly.
+ *
+ * When the deployment has no trusted proxy there is no believable client IP
+ * (see `clientIp` in `lib/api.ts`), so this becomes a no-op rather than
+ * pretending a spoofable header is an identity — or herding every caller into
+ * one shared bucket that a single attacker could exhaust to lock the office
+ * out. Every endpoint that uses this also carries an account- or token-keyed
+ * bucket, which is the limit that actually holds.
+ */
+export async function rateLimitIp(
+  ip: string,
+  prefix: string,
+  options: Omit<RateLimitOptions, 'key'>,
+): Promise<RateLimitResult> {
+  if (!hasReliableIp(ip)) return { allowed: true, remaining: -1, retryAfter: 0 };
+  return rateLimit({ key: `${prefix}:${ip}`, ...options });
+}
+
 /** Tuned limits for the sensitive endpoints. */
 export const LIMITS = {
   login: { limit: 5, windowMs: 5 * 60_000, blockMs: 10 * 60_000 },
   otpRequest: { limit: 3, windowMs: 10 * 60_000, blockMs: 10 * 60_000 },
   otpVerify: { limit: 6, windowMs: 10 * 60_000, blockMs: 10 * 60_000 },
   reveal: { limit: 10, windowMs: 5 * 60_000, blockMs: 5 * 60_000 },
+  // Generous: one call per sign-in attempt is normal, and it reveals nothing
+  // beyond which credential form to send. Tight enough to stop a sweep.
+  prelogin: { limit: 20, windowMs: 5 * 60_000, blockMs: 5 * 60_000 },
 } as const;

@@ -42,6 +42,44 @@ function resolveFile(key: string): string {
   return path.join(DATA_DIR, path.basename(key));
 }
 
+/**
+ * Documents that are deliberately not backed up.
+ *
+ * Rate-limit buckets are rewritten constantly, hold nothing worth recovering,
+ * and would double this driver's write volume for no benefit.
+ */
+const NO_BACKUP = new Set(['rate-limits.json']);
+
+/** `organizations.json` -> `organizations.backup.json` */
+function backupPath(file: string): string {
+  return file.replace(/\.json$/i, '') + '.backup.json';
+}
+
+/**
+ * Keep the previous contents before overwriting.
+ *
+ * The temp-file + rename dance below already rules out a *torn* write, but it
+ * cannot help with a write that succeeds and is wrong — a bad migration, a
+ * cascading delete that took more than intended, an operator editing the file
+ * by hand. One generation back is enough to recover from that, and for a vault
+ * whose whole datastore is a few hundred kilobytes of JSON the cost is
+ * negligible.
+ *
+ * Never allowed to fail the write it is protecting: if the backup cannot be
+ * taken, the real write still goes ahead and the problem is logged.
+ */
+async function backup(file: string): Promise<void> {
+  if (NO_BACKUP.has(path.basename(file))) return;
+  try {
+    await fs.copyFile(file, backupPath(file));
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    // First write of a new document: nothing to preserve yet.
+    if (err.code === 'ENOENT') return;
+    console.error(`[storage:fs] could not back up ${path.basename(file)}`, err.code ?? err);
+  }
+}
+
 async function writeRaw<T>(key: string, value: T): Promise<void> {
   await fs.mkdir(DATA_DIR, { recursive: true });
   const file = resolveFile(key);
@@ -57,11 +95,26 @@ async function writeRaw<T>(key: string, value: T): Promise<void> {
     await handle.close();
   }
 
+  // Snapshot the outgoing version while it is still on disk.
+  await backup(file);
+
   try {
     await fs.rename(tmp, file);
   } catch (error) {
     await fs.rm(tmp, { force: true }).catch(() => undefined);
     throw error;
+  }
+}
+
+/** Parse the backup copy, or null when there isn't a usable one. */
+async function restoreFromBackup<T>(file: string): Promise<T | null> {
+  try {
+    const text = await fs.readFile(backupPath(file), 'utf8');
+    if (!text.trim()) return null;
+    return JSON.parse(text) as T;
+  } catch {
+    // No backup, or the backup is corrupt too. Caller falls back to the seed.
+    return null;
   }
 }
 
@@ -80,10 +133,26 @@ async function readRaw<T>(key: string, fallback: T): Promise<T> {
     }
 
     if (error instanceof SyntaxError) {
-      // Corrupt JSON: quarantine it so an operator can inspect it, then reset.
+      // Corrupt JSON: quarantine it so an operator can inspect it.
       const quarantine = `${file}.corrupt-${Date.now()}`;
       await fs.rename(file, quarantine).catch(() => undefined);
       console.error(`[storage:fs] ${key} was corrupt; moved to ${quarantine}`);
+
+      /**
+       * Recover from the backup rather than resetting.
+       *
+       * Silently handing back an empty collection here would look, to every
+       * layer above, exactly like "the vault is empty" — and the next write
+       * would then persist that emptiness over the top. Restoring the previous
+       * generation turns a total loss into the loss of one write.
+       */
+      const restored = await restoreFromBackup<T>(file);
+      if (restored !== null) {
+        console.error(`[storage:fs] restored ${key} from its backup`);
+        await writeRaw(key, restored);
+        return restored;
+      }
+
       await writeRaw(key, fallback);
       return fallback;
     }

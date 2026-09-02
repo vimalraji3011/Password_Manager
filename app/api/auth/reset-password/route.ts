@@ -1,7 +1,8 @@
 import { clientIp, fail, ok, readBody, userAgent, withPublic } from '@/lib/api';
 import { recordAudit } from '@/lib/audit';
+import { PASSWORD_KDF } from '@/lib/password-kdf';
 import { findUserByEmail, hashPassword, users } from '@/lib/auth';
-import { LIMITS, rateLimit } from '@/lib/rate-limit';
+import { LIMITS, rateLimitIp } from '@/lib/rate-limit';
 import { RESET_FAILURE_MESSAGE, verifyResetToken } from '@/lib/reset-flow';
 import { fieldErrors, resetPasswordSchema } from '@/lib/validation';
 
@@ -17,7 +18,7 @@ import { fieldErrors, resetPasswordSchema } from '@/lib/validation';
 export const POST = withPublic(async (request) => {
   const ip = clientIp(request);
 
-  const limit = await rateLimit({ key: `otp:verify:${ip}`, ...LIMITS.otpVerify });
+  const limit = await rateLimitIp(ip, 'otp:verify', LIMITS.otpVerify);
   if (!limit.allowed) {
     return fail(
       `Too many attempts. Try again in ${Math.ceil(limit.retryAfter / 60)} minute(s).`,
@@ -49,7 +50,9 @@ export const POST = withPublic(async (request) => {
   }
 
   await users.update(user.id, {
+    // `password` is already the browser-derived proof; bcrypt goes on top.
     passwordHash: await hashPassword(password),
+    passwordKdf: PASSWORD_KDF,
     updatedAt: new Date().toISOString(),
     mustChangePassword: false,
   });

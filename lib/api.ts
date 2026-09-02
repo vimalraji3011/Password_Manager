@@ -1,6 +1,6 @@
 import 'server-only';
 import { NextResponse, type NextRequest } from 'next/server';
-import { getCurrentUser } from '@/lib/auth';
+import { getCurrentUser, refreshSession } from '@/lib/auth';
 import type { ApiResponse, Role, User } from '@/types';
 
 /**
@@ -36,12 +36,71 @@ export function serverError(error: unknown): NextResponse<ApiResponse<never>> {
   return fail(message, 500);
 }
 
+/**
+ * Stamp a response as uncacheable.
+ *
+ * Applied to every authenticated API response, not just the reveal endpoint.
+ * Organization lists, usernames and audit trails are all sensitive enough that
+ * a shared corporate proxy — or the browser's own back/forward cache on a
+ * kiosk machine — should never hold a copy after sign-out.
+ */
+export function noStore<T extends NextResponse>(response: T): T {
+  response.headers.set('cache-control', 'no-store, no-cache, must-revalidate, private');
+  response.headers.set('pragma', 'no-cache');
+  response.headers.set('expires', '0');
+  return response;
+}
+
+/**
+ * Best-effort client IP, used for rate-limit keys and the audit trail.
+ *
+ * `x-forwarded-for` is just a request header: anyone can send one. Trusting it
+ * unconditionally would hand an attacker a fresh rate-limit bucket per request
+ * — `login:ip:1.2.3.4`, `login:ip:1.2.3.5`, … — which quietly turns "5 attempts
+ * per 5 minutes" into no limit at all.
+ *
+ * So the forwarded headers are only honoured when `TRUST_PROXY=true` says this
+ * app really is behind a reverse proxy that overwrites them (nginx, Cloudflare,
+ * Vercel). Otherwise the socket address is used, and when even that is
+ * unavailable every caller collapses into one shared bucket — throttling too
+ * much rather than too little.
+ */
 export function clientIp(request: NextRequest): string {
-  const forwarded = request.headers.get('x-forwarded-for');
-  if (forwarded) return forwarded.split(',')[0]!.trim();
-  return (
-    request.headers.get('x-real-ip') ?? request.headers.get('cf-connecting-ip') ?? '127.0.0.1'
-  );
+  if (process.env.TRUST_PROXY === 'true') {
+    const forwarded = request.headers.get('x-forwarded-for');
+    // Left-most entry is the original client; the rest are proxy hops.
+    if (forwarded) {
+      const first = forwarded.split(',')[0]?.trim();
+      if (first) return first;
+    }
+    const direct = request.headers.get('cf-connecting-ip') ?? request.headers.get('x-real-ip');
+    if (direct) return direct.trim();
+  }
+
+  return UNKNOWN_IP;
+}
+
+/**
+ * Sentinel for "no IP we are willing to believe".
+ *
+ * Next 15 removed `NextRequest.ip`, so without a trusted proxy there is no
+ * socket address available to a route handler at all — the only candidate is a
+ * header the caller wrote themselves.
+ */
+export const UNKNOWN_IP = 'unknown';
+
+/**
+ * Whether an IP is trustworthy enough to rate-limit on.
+ *
+ * Callers skip their per-IP bucket when this is false. That is deliberate: a
+ * bucket keyed on a spoofable header is not a limit, and collapsing every
+ * caller into one shared `unknown` bucket would be worse still — a single
+ * attacker could exhaust it and lock the whole office out of the vault. The
+ * per-account buckets, which key on something the attacker cannot rotate,
+ * remain in force either way.
+ */
+export function hasReliableIp(ip: string): boolean {
+  return ip !== UNKNOWN_IP;
 }
 
 export function userAgent(request: NextRequest): string {
@@ -91,7 +150,10 @@ export function withAuth<T>(handler: Handler<ApiResponse<T>>, options?: { role?:
       if (!user) return unauthorized();
       if (options?.role && user.role !== options.role) return forbidden();
 
-      return await handler({ request, user });
+      // Real activity, so push the inactivity window forward.
+      await refreshSession();
+
+      return noStore(await handler({ request, user }));
     } catch (error) {
       return serverError(error);
     }
@@ -116,7 +178,9 @@ export function withAuthParams<T, P extends Record<string, string>>(
       if (!user) return unauthorized();
       if (options?.role && user.role !== options.role) return forbidden();
 
-      return await handler({ request, user, params: await ctx.params });
+      await refreshSession();
+
+      return noStore(await handler({ request, user, params: await ctx.params }));
     } catch (error) {
       return serverError(error);
     }

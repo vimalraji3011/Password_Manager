@@ -6,15 +6,31 @@
  * them straight onto auto-increment primary keys.
  */
 
+import type { PasswordKdf } from '@/lib/password-kdf';
+
 export type Role = 'admin' | 'viewer';
 
-/** Login identity. `passwordHash` is bcrypt — never reversible. */
+/**
+ * Login identity.
+ *
+ * `passwordHash` is bcrypt and never reversible. What it is bcrypt *of* depends
+ * on `passwordKdf`: for a migrated account it is the PBKDF2 proof the browser
+ * derived, for a legacy one it is the password itself.
+ */
 export interface User {
   id: number;
   name: string;
   email: string;
   mobile: string;
   passwordHash: string;
+  /**
+   * Which credential the browser sends for this account.
+   *
+   * Absent means legacy — the account predates client-side derivation and still
+   * expects a plaintext password, until its owner next signs in and is upgraded
+   * in place.
+   */
+  passwordKdf?: PasswordKdf;
   role: Role;
   lastLogin: string | null;
   createdAt: string;
@@ -139,4 +155,12 @@ export interface SessionPayload {
   email: string;
   name: string;
   role: Role;
+  /**
+   * Absolute session deadline (unix seconds), fixed at sign-in.
+   *
+   * The token's own `exp` is the *idle* deadline and slides forward as the user
+   * works; `abs` is the ceiling that sliding can never push past. Without it a
+   * stolen cookie could be kept alive forever just by polling the API.
+   */
+  abs: number;
 }

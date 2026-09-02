@@ -1,9 +1,11 @@
 import { Suspense } from 'react';
 import { redirect } from 'next/navigation';
 import { AppShell } from '@/components/layout/app-shell';
+import { IdleTimeout } from '@/components/layout/idle-timeout';
 import { MustChangePasswordBanner } from '@/components/layout/must-change-password-banner';
 import { RouteNotices } from '@/components/layout/route-notices';
 import { getCurrentUser, toSafeUser } from '@/lib/auth';
+import { getIdleTimeoutSeconds } from '@/lib/session';
 
 /**
  * Layout for every authenticated page.
@@ -24,6 +26,10 @@ export default async function AuthenticatedLayout({ children }: { children: Reac
       <Suspense fallback={null}>
         <RouteNotices />
       </Suspense>
+
+      {/* Clears the screen on an unattended machine; the token expiry is the
+          control this mirrors. */}
+      <IdleTimeout idleSeconds={getIdleTimeoutSeconds()} />
 
       {user.mustChangePassword ? <MustChangePasswordBanner email={user.email} /> : null}
 

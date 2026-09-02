@@ -12,9 +12,22 @@ import { TooltipProvider } from '@/components/ui/tooltip';
  * flash of the wrong theme. Toasts live here too, which is what lets any
  * component call `toast()` without wiring up a context of its own.
  */
-export function Providers({ children }: { children: React.ReactNode }) {
+export function Providers({
+  children,
+  nonce,
+}: {
+  children: React.ReactNode;
+  /** CSP nonce from middleware, so the anti-flash inline script is allowed to run. */
+  nonce?: string;
+}) {
   return (
-    <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
+    <ThemeProvider
+      attribute="class"
+      defaultTheme="system"
+      enableSystem
+      disableTransitionOnChange
+      nonce={nonce}
+    >
       <TooltipProvider delayDuration={300} skipDelayDuration={0}>
         {children}
         <Toaster

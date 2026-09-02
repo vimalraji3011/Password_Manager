@@ -11,7 +11,8 @@ import { Field } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
 import { Separator } from '@/components/ui/separator';
-import { apiFetch, useMutation } from '@/hooks/use-api';
+import { ApiError, apiFetch, useMutation } from '@/hooks/use-api';
+import { derivePasswordProof, passwordPolicyError } from '@/lib/password-kdf';
 import { formatDateTime, initials } from '@/lib/utils';
 import type { SafeUser } from '@/types';
 
@@ -37,9 +38,34 @@ export function ProfileView({ user }: { user: SafeUser }) {
     apiFetch<SafeUser>('/api/profile', { method: 'PATCH', json: input }),
   );
 
+  /**
+   * Both passwords are derived here, so neither the old nor the new one is ever
+   * transmitted. Strength and confirmation are checked locally first: the server
+   * receives two 44-character proofs and cannot judge either.
+   */
   const changePassword = useMutation(
-    (input: { currentPassword: string; password: string; confirmPassword: string }) =>
-      apiFetch<{ changed: true }>('/api/profile/password', { method: 'POST', json: input }),
+    async (input: { currentPassword: string; password: string; confirmPassword: string }) => {
+      if (input.password !== input.confirmPassword) {
+        throw new ApiError('Please correct the highlighted fields.', 422, {
+          confirmPassword: 'Passwords do not match',
+        });
+      }
+
+      const policy = passwordPolicyError(input.password);
+      if (policy) {
+        throw new ApiError('Please correct the highlighted fields.', 422, { password: policy });
+      }
+
+      const [currentProof, nextProof] = await Promise.all([
+        derivePasswordProof(input.currentPassword, user.email),
+        derivePasswordProof(input.password, user.email),
+      ]);
+
+      return apiFetch<{ changed: true }>('/api/profile/password', {
+        method: 'POST',
+        json: { currentPassword: currentProof, password: nextProof },
+      });
+    },
   );
 
   const detailsDirty = name !== user.name || mobile !== user.mobile;

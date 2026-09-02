@@ -1,5 +1,6 @@
 import { clientIp, fail, ok, readBody, userAgent, withAuth } from '@/lib/api';
 import { recordAudit } from '@/lib/audit';
+import { PASSWORD_KDF } from '@/lib/password-kdf';
 import { comparePassword, hashPassword, users } from '@/lib/auth';
 import { changePasswordSchema, fieldErrors } from '@/lib/validation';
 
@@ -35,7 +36,9 @@ export const POST = withAuth<{ changed: true }>(async ({ request, user }) => {
   }
 
   await users.update(user.id, {
+    // `password` is already the browser-derived proof; bcrypt goes on top.
     passwordHash: await hashPassword(password),
+    passwordKdf: PASSWORD_KDF,
     mustChangePassword: false,
     updatedAt: new Date().toISOString(),
   });

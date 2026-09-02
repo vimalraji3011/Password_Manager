@@ -2,7 +2,15 @@ import 'server-only';
 import bcrypt from 'bcryptjs';
 import { cookies } from 'next/headers';
 import { Collection, FILES } from '@/lib/json-storage';
-import { verifySessionToken, signSessionToken, SESSION_COOKIE } from '@/lib/session';
+import {
+  SESSION_COOKIE,
+  getExpirySeconds,
+  getIdleTimeoutSeconds,
+  refreshSessionToken,
+  sessionCookieOptions,
+  signSessionToken,
+  verifySessionToken,
+} from '@/lib/session';
 import type { Role, SafeUser, SessionPayload, User } from '@/types';
 
 /**
@@ -67,19 +75,39 @@ export async function createSession(user: User): Promise<void> {
     email: user.email,
     name: user.name,
     role: user.role,
+    // The absolute deadline is set once, here, and survives every refresh.
+    abs: Math.floor(Date.now() / 1000) + getExpirySeconds(),
   });
+
   const jar = await cookies();
-  jar.set(SESSION_COOKIE, token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    path: '/',
-    maxAge: Number(process.env.JWT_EXPIRY_SECONDS ?? 28_800),
-  });
+  // Cookie lifetime tracks the *idle* window, so a browser left open overnight
+  // discards the cookie by itself rather than presenting a dead token.
+  jar.set(SESSION_COOKIE, token, sessionCookieOptions(getIdleTimeoutSeconds()));
+}
+
+/**
+ * Slide the idle window forward for an active user.
+ *
+ * Called from the API wrapper on every authenticated request. A no-op when the
+ * token is fresh, already pinned to the absolute deadline, or invalid — so it
+ * can never resurrect a session that should have ended.
+ */
+export async function refreshSession(): Promise<void> {
+  const jar = await cookies();
+  const token = jar.get(SESSION_COOKIE)?.value;
+  if (!token) return;
+
+  const renewed = await refreshSessionToken(token);
+  if (!renewed) return;
+
+  jar.set(SESSION_COOKIE, renewed, sessionCookieOptions(getIdleTimeoutSeconds()));
 }
 
 export async function destroySession(): Promise<void> {
   const jar = await cookies();
+  // Overwrite before deleting: some proxies drop a bare `Max-Age=0` delete, and
+  // a half-cleared session cookie is worse than none.
+  jar.set(SESSION_COOKIE, '', sessionCookieOptions(0));
   jar.delete(SESSION_COOKIE);
 }
 

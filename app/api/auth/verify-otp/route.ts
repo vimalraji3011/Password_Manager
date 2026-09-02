@@ -1,6 +1,6 @@
 import { clientIp, fail, ok, readBody, withPublic } from '@/lib/api';
 import { findUserByEmail } from '@/lib/auth';
-import { LIMITS, rateLimit } from '@/lib/rate-limit';
+import { LIMITS, rateLimitIp } from '@/lib/rate-limit';
 import { RESET_FAILURE_MESSAGE, verifyResetToken } from '@/lib/reset-flow';
 import { fieldErrors, verifyOtpSchema } from '@/lib/validation';
 
@@ -14,7 +14,7 @@ import { fieldErrors, verifyOtpSchema } from '@/lib/validation';
 export const POST = withPublic(async (request) => {
   const ip = clientIp(request);
 
-  const limit = await rateLimit({ key: `otp:verify:${ip}`, ...LIMITS.otpVerify });
+  const limit = await rateLimitIp(ip, 'otp:verify', LIMITS.otpVerify);
   if (!limit.allowed) {
     return fail(
       `Too many attempts. Try again in ${Math.ceil(limit.retryAfter / 60)} minute(s).`,

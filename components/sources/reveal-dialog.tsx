@@ -18,6 +18,7 @@ import { Field } from '@/components/ui/field';
 import { PasswordInput } from '@/components/ui/password-input';
 import { apiFetch, useMutation } from '@/hooks/use-api';
 import { useCountdown } from '@/hooks/use-countdown';
+import { derivePasswordProof } from '@/lib/password-kdf';
 import type { SafeSource } from '@/types';
 
 interface RevealResult {
@@ -40,10 +41,13 @@ interface RevealResult {
  */
 export function RevealDialog({
   source,
+  email,
   open,
   onOpenChange,
 }: {
   source: SafeSource | null;
+  /** The signed-in user's address — the salt the re-auth proof is derived under. */
+  email: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -55,12 +59,16 @@ export function RevealDialog({
     onComplete: () => setRevealed(null),
   });
 
-  const reveal = useMutation((input: { id: number; password: string }) =>
-    apiFetch<RevealResult>(`/api/sources/${input.id}/reveal`, {
+  const reveal = useMutation(async (input: { id: number; password: string }) => {
+    // Same derivation as sign-in: the re-auth password never leaves the browser
+    // either, or the reveal step would quietly reintroduce what login removed.
+    const proof = await derivePasswordProof(input.password, email);
+
+    return apiFetch<RevealResult>(`/api/sources/${input.id}/reveal`, {
       method: 'POST',
-      json: { password: input.password },
-    }),
-  );
+      json: { password: proof },
+    });
+  });
 
   // `stop` is a stable useCallback, so pulling it out of the object keeps
   // the effect from re-running on every render of this component.
@@ -128,9 +136,20 @@ export function RevealDialog({
                   <CopyButton
                     value={revealed.password}
                     label="Copy password"
-                    successMessage="Password copied. It will clear from your clipboard when you copy something else."
+                    successMessage="Password copied. It stays on your clipboard until you copy something else."
                     variant="secondary"
                     size="icon-sm"
+                    confirm={{
+                      title: 'Copy this password to the clipboard?',
+                      description: (
+                        <>
+                          The clipboard is shared with every app on this machine and is not
+                          cleared when the 10-second countdown ends. Paste it where you need it,
+                          then copy something else to displace it.
+                        </>
+                      ),
+                      confirmLabel: 'Copy password',
+                    }}
                   />
                 </div>
               </div>

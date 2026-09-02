@@ -3,7 +3,7 @@ import { recordAudit } from '@/lib/audit';
 import { findUserByEmail } from '@/lib/auth';
 import { generateOtp, hashToken } from '@/lib/crypto';
 import { sendMail, templates } from '@/lib/mailer';
-import { LIMITS, rateLimit } from '@/lib/rate-limit';
+import { LIMITS, rateLimit, rateLimitIp } from '@/lib/rate-limit';
 import { resetRequests } from '@/lib/repository';
 import { OTP_TTL_MINUTES } from '@/lib/constants';
 import { fieldErrors, forgotPasswordSchema } from '@/lib/validation';
@@ -21,10 +21,10 @@ import { fieldErrors, forgotPasswordSchema } from '@/lib/validation';
 export const POST = withPublic(async (request) => {
   const ip = clientIp(request);
 
-  const limit = await rateLimit({ key: `otp:request:${ip}`, ...LIMITS.otpRequest });
-  if (!limit.allowed) {
+  const ipLimit = await rateLimitIp(ip, 'otp:request', LIMITS.otpRequest);
+  if (!ipLimit.allowed) {
     return fail(
-      `Too many reset requests. Try again in ${Math.ceil(limit.retryAfter / 60)} minute(s).`,
+      `Too many reset requests. Try again in ${Math.ceil(ipLimit.retryAfter / 60)} minute(s).`,
       429,
     );
   }
@@ -35,6 +35,24 @@ export const POST = withPublic(async (request) => {
   }
 
   const { email } = parsed.data;
+
+  /**
+   * Per-address limit, applied before the account lookup.
+   *
+   * This is what stops someone mail-bombing a colleague's inbox with reset
+   * codes, and unlike the per-IP bucket it keys on something the sender cannot
+   * rotate. Checked before the lookup so the throttle behaves identically for
+   * addresses that do and do not have an account — otherwise the difference
+   * would be an enumeration oracle, undoing the care taken below.
+   */
+  const emailLimit = await rateLimit({ key: `otp:request:email:${email}`, ...LIMITS.otpRequest });
+  if (!emailLimit.allowed) {
+    return fail(
+      `Too many reset requests. Try again in ${Math.ceil(emailLimit.retryAfter / 60)} minute(s).`,
+      429,
+    );
+  }
+
   const user = await findUserByEmail(email);
 
   // Deliberately the same shape and timing-insensitive path for unknown users.

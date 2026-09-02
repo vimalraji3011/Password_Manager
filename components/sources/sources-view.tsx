@@ -53,12 +53,15 @@ export function SourcesView({
   initialSources,
   organizations,
   role,
+  email,
 }: {
   organizationId: number;
   organizationName: string;
   initialSources: SafeSource[];
   organizations: Organization[];
   role: Role;
+  /** Signed-in user's address; the reveal dialog needs it to derive the re-auth proof. */
+  email: string;
 }) {
   const router = useRouter();
   const params = useSearchParams();
@@ -416,6 +419,7 @@ export function SourcesView({
       {/* Reveal is available to admins only; the dialog itself re-checks. */}
       <RevealDialog
         source={revealing}
+        email={email}
         open={Boolean(revealing)}
         onOpenChange={(open) => !open && setRevealing(null)}
       />

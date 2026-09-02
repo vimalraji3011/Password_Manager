@@ -4,6 +4,7 @@ import * as React from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { ArrowRight, Mail } from 'lucide-react';
+import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Field } from '@/components/ui/field';
@@ -11,10 +12,40 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { PasswordInput } from '@/components/ui/password-input';
 import { apiFetch, useMutation } from '@/hooks/use-api';
+import {
+  PASSWORD_KDF,
+  PasswordKdfUnavailableError,
+  derivePasswordProof,
+  kdfSupported,
+  type PasswordKdf,
+} from '@/lib/password-kdf';
 import type { SafeUser } from '@/types';
 
 /** localStorage key for the remembered address. Only the email, never a password. */
 const REMEMBER_KEY = 'opm:last-email';
+
+/**
+ * Sanitise the `?next=` destination.
+ *
+ * `next` arrives in the URL, so anyone can put anything in it. A bare
+ * `startsWith('/')` test is not enough: `//evil.example` and `/\evil.example`
+ * are both protocol-relative URLs that browsers happily resolve to another
+ * origin, which would turn the login screen into an open redirect — the classic
+ * setup for a convincing credential-phishing link that genuinely starts on the
+ * real vault's domain.
+ *
+ * Only a single-slash, same-origin path is accepted; anything else falls back
+ * to the dashboard.
+ */
+function safeNextPath(value: string | null): string {
+  if (!value) return '/dashboard';
+  if (!value.startsWith('/')) return '/dashboard';
+  // Rules out `//host` and the backslash variant `/\host`, which some parsers
+  // and proxies still normalise into a scheme-relative URL.
+  const second = value.charAt(1);
+  if (second === '/' || second === '\\') return '/dashboard';
+  return value;
+}
 
 export function LoginForm() {
   const router = useRouter();
@@ -24,6 +55,15 @@ export function LoginForm() {
   const [email, setEmail] = React.useState('');
   const [password, setPassword] = React.useState('');
   const [remember, setRemember] = React.useState(false);
+
+  // Explain an automatic sign-out rather than leaving the user to wonder why
+  // they are back at the login screen.
+  React.useEffect(() => {
+    if (params.get('timeout') !== '1') return;
+    toast.info('Signed out', {
+      description: 'Your session ended after a period of inactivity.',
+    });
+  }, [params]);
 
   // Prefill from a previous "remember me". Runs after mount so the server-
   // rendered markup and the first client render agree.
@@ -39,12 +79,47 @@ export function LoginForm() {
     }
   }, []);
 
-  const login = useMutation((input: { email: string; password: string; remember: boolean }) =>
-    apiFetch<{ user: SafeUser }>('/api/auth/login', { method: 'POST', json: input }),
+  /**
+   * Sign in without ever putting the password on the wire.
+   *
+   * Ask the server which credential this account expects, derive the proof
+   * locally when it wants one, and post that instead. A legacy account is told
+   * to send the password one final time — the login route upgrades it in place,
+   * so this is the last request that will ever carry it.
+   */
+  const login = useMutation(
+    async (input: { email: string; password: string; remember: boolean }) => {
+      const { kdf } = await apiFetch<{ kdf: PasswordKdf; iterations: number }>(
+        '/api/auth/prelogin',
+        { method: 'POST', json: { email: input.email } },
+      );
+
+      const credential =
+        kdf === PASSWORD_KDF
+          ? await derivePasswordProof(input.password, input.email)
+          : input.password;
+
+      return apiFetch<{ user: SafeUser }>('/api/auth/login', {
+        method: 'POST',
+        json: { email: input.email, password: credential, remember: input.remember },
+      });
+    },
   );
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
+
+    /**
+     * Refuse rather than fall back.
+     *
+     * WebCrypto is missing only on an insecure origin. Quietly posting the raw
+     * password in that case would hand an attacker a downgrade they could force
+     * by stripping TLS, so this fails closed and says why.
+     */
+    if (!kdfSupported()) {
+      toast.error('Insecure connection', { description: new PasswordKdfUnavailableError().message });
+      return;
+    }
 
     await login.run(
       { email, password, remember },
@@ -58,7 +133,7 @@ export function LoginForm() {
           }
 
           // `replace` so Back does not land on the login screen post-auth.
-          router.replace(nextPath && nextPath.startsWith('/') ? nextPath : '/dashboard');
+          router.replace(safeNextPath(nextPath));
           router.refresh();
           void user;
         },

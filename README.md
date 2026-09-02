@@ -39,9 +39,34 @@ This is the single most important design decision in the codebase.
 | | Login passwords | Stored credentials |
 | --- | --- | --- |
 | Where | `data/users.json` | `data/sources.json` |
-| Algorithm | **bcrypt**, cost 12 | **AES-256-GCM** |
+| Algorithm | **PBKDF2-SHA256** in the browser, then **bcrypt** cost 12 on the server | **AES-256-GCM** |
 | Reversible | No — one way, by design | **Yes** — that is the point |
 | Key | none (salted hash) | `MASTER_ENCRYPTION_KEY` |
+
+The login password never leaves the browser. It is stretched with
+PBKDF2-SHA256 (600 000 iterations, salted with the account's email) and only
+the resulting *proof* is sent, which the server then bcrypts before storing —
+see `lib/password-kdf.ts`.
+
+This does not defeat replay; an intercepted proof is as usable as an
+intercepted password, and TLS is what prevents both. What it buys is that a
+password the user has probably reused elsewhere never reaches this server, its
+access logs, or a crash dump.
+
+Two consequences worth knowing:
+
+- **HTTPS is mandatory.** `crypto.subtle` exists only in a secure context, so
+  on a plain-HTTP origin the login form refuses to submit rather than quietly
+  falling back to sending the password.
+- **Password strength is enforced in the browser.** The server receives 44
+  characters of base64 and cannot judge it. A modified client could skip the
+  policy — accepted here, since anyone able to do that already holds vault
+  credentials.
+
+Accounts created before this shipped are upgraded transparently: `POST
+/api/auth/prelogin` tells the browser that account still expects a password,
+and the login route derives the proof and re-stores it during that final
+sign-in.
 
 Vault credentials must be readable again by an authorised user, so they are
 *encrypted*, never hashed. AES-**GCM** specifically, because it is authenticated:
@@ -197,15 +222,16 @@ stays local to `lib/storage/`.
 
 | Concern | Implementation |
 | --- | --- |
-| Login passwords | bcrypt, cost 12 |
+| Login passwords | PBKDF2-SHA256 (600k, browser) then bcrypt cost 12 (server) |
 | Stored credentials | AES-256-GCM, authenticated |
-| Sessions | JWT (HS256, `jose`) in an HTTP-only, SameSite=Lax cookie, 8 h |
+| Sessions | JWT (HS256, `jose`) in an HTTP-only, SameSite=Strict cookie; 30 min idle, 8 h absolute |
 | CSRF | `x-requested-with` header + Origin/Host check on every mutation |
-| Rate limiting | Login (5 / 5 min), OTP request (3 / 10 min), OTP verify (6 / 10 min), reveal (10 / 5 min) |
+| Rate limiting | Login (5 / 5 min), OTP request (3 / 10 min), OTP verify (6 / 10 min), reveal (10 / 5 min), prelogin (20 / 5 min) |
 | Account enumeration | Login and forgot-password give identical responses for unknown addresses |
 | Input validation | Zod schemas shared by the API and the forms |
 | OTP / token storage | SHA-256 hashed, single-use, constant-time comparison |
-| Headers | `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, `Permissions-Policy` |
+| Headers | Nonce-based CSP, HSTS, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, `Permissions-Policy` |
+| Datastore | Atomic temp-file + rename, one-generation `*.backup.json`, restore on corruption |
 | Indexing | `robots: noindex, nofollow` — an internal vault should never be indexed |
 
 `jose` rather than `jsonwebtoken` because `middleware.ts` runs in the Edge
@@ -355,8 +381,14 @@ The filesystem driver is simpler and needs no database. Requirements:
 - **Persistent volume** mounted so `data/` survives restarts.
 - **Single instance.** Atomic writes protect against a crash, not against two
   processes writing the same file. Use Postgres if you need replicas.
-- **HTTPS.** Session cookies set `secure` in production, so over plain HTTP
-  nobody can sign in.
+- **HTTPS — required, not advisory.** Session cookies set `secure` in
+  production, and client-side password derivation needs `crypto.subtle`, which
+  browsers expose only in a secure context. On a plain-HTTP origin the login
+  form refuses to submit. `localhost` counts as secure, so local development is
+  unaffected.
+- **`TRUST_PROXY=true`** when behind a reverse proxy or CDN. Otherwise
+  `X-Forwarded-For` is ignored, audit entries record `unknown`, and the per-IP
+  rate limits stand down (per-account limits still apply).
 
 Rate limiting follows the driver: an in-memory Map under `filesystem` (correct for
 one process) and the shared datastore under `postgres`. That second part matters —

@@ -8,7 +8,8 @@ import { AlertTriangle, ArrowRight, CheckCircle2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Field } from '@/components/ui/field';
 import { PasswordInput } from '@/components/ui/password-input';
-import { apiFetch, useMutation } from '@/hooks/use-api';
+import { ApiError, apiFetch, useMutation } from '@/hooks/use-api';
+import { derivePasswordProof, passwordPolicyError } from '@/lib/password-kdf';
 
 /**
  * Completes an approved reveal-password reset.
@@ -17,7 +18,7 @@ import { apiFetch, useMutation } from '@/hooks/use-api';
  * for a password change in a single request. A missing token short-circuits to
  * an explanation rather than showing a form that cannot possibly succeed.
  */
-export function VerifyResetForm({ token }: { token: string }) {
+export function VerifyResetForm({ token, email }: { token: string; email: string }) {
   const router = useRouter();
 
   const [password, setPassword] = React.useState('');
@@ -25,11 +26,27 @@ export function VerifyResetForm({ token }: { token: string }) {
   const [done, setDone] = React.useState(false);
 
   const complete = useMutation(
-    (input: { token: string; password: string; confirmPassword: string }) =>
-      apiFetch<{ completed: true; email: string }>('/api/reset-requests/complete', {
+    async (input: { token: string; password: string; confirmPassword: string }) => {
+      if (input.password !== input.confirmPassword) {
+        throw new ApiError('Please correct the highlighted fields.', 422, {
+          confirmPassword: 'Passwords do not match',
+        });
+      }
+
+      const policy = passwordPolicyError(input.password);
+      if (policy) {
+        throw new ApiError('Please correct the highlighted fields.', 422, { password: policy });
+      }
+
+      return apiFetch<{ completed: true; email: string }>('/api/reset-requests/complete', {
         method: 'POST',
-        json: input,
-      }),
+        json: {
+          token: input.token,
+          // Salted with the address the token resolved to, server-side.
+          password: await derivePasswordProof(input.password, email),
+        },
+      });
+    },
   );
 
   if (!token) {

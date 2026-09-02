@@ -2,6 +2,7 @@
 
 import * as React from 'react';
 import { Check, Copy } from 'lucide-react';
+import { ConfirmDialog } from '@/components/shared/confirm-dialog';
 import { Button, type ButtonProps } from '@/components/ui/button';
 import { Hint } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
@@ -17,6 +18,7 @@ export function CopyButton({
   value,
   label = 'Copy',
   successMessage = 'Copied to clipboard',
+  confirm,
   variant = 'ghost',
   size = 'icon-sm',
   ...props
@@ -24,8 +26,18 @@ export function CopyButton({
   value: string;
   label?: string;
   successMessage?: string;
+  /**
+   * Ask before copying.
+   *
+   * Used for secrets. The clipboard is shared with every other application on
+   * the machine, survives the 10-second reveal countdown, and on Windows is
+   * visible in clipboard history — so putting a vault credential there is a
+   * decision worth making on purpose rather than by brushing a button.
+   */
+  confirm?: { title: string; description: React.ReactNode; confirmLabel?: string };
 } & Omit<ButtonProps, 'value' | 'onClick' | 'children'>) {
   const [copied, setCopied] = React.useState(false);
+  const [asking, setAsking] = React.useState(false);
   const timer = React.useRef<ReturnType<typeof setTimeout>>(undefined);
 
   React.useEffect(() => () => clearTimeout(timer.current), []);
@@ -54,17 +66,34 @@ export function CopyButton({
   }
 
   return (
-    <Hint label={copied ? 'Copied' : label}>
-      <Button
-        type="button"
-        variant={variant}
-        size={size}
-        onClick={copy}
-        aria-label={label}
-        {...props}
-      >
-        {copied ? <Check className="text-success" /> : <Copy />}
-      </Button>
-    </Hint>
+    <>
+      <Hint label={copied ? 'Copied' : label}>
+        <Button
+          type="button"
+          variant={variant}
+          size={size}
+          onClick={confirm ? () => setAsking(true) : copy}
+          aria-label={label}
+          {...props}
+        >
+          {copied ? <Check className="text-success" /> : <Copy />}
+        </Button>
+      </Hint>
+
+      {confirm ? (
+        <ConfirmDialog
+          open={asking}
+          onOpenChange={setAsking}
+          title={confirm.title}
+          description={confirm.description}
+          confirmLabel={confirm.confirmLabel ?? 'Copy'}
+          tone="caution"
+          onConfirm={async () => {
+            setAsking(false);
+            await copy();
+          }}
+        />
+      ) : null}
+    </>
   );
 }

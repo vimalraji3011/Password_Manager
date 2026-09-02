@@ -10,7 +10,8 @@ import { Button } from '@/components/ui/button';
 import { Field } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { PasswordInput } from '@/components/ui/password-input';
-import { apiFetch, useMutation } from '@/hooks/use-api';
+import { ApiError, apiFetch, useMutation } from '@/hooks/use-api';
+import { derivePasswordProof, passwordPolicyError } from '@/lib/password-kdf';
 import { useCountdown } from '@/hooks/use-countdown';
 import { cn } from '@/lib/utils';
 
@@ -66,8 +67,29 @@ export function ResetFlowForm({
   );
 
   const submitPassword = useMutation(
-    (input: { email: string; otp: string; password: string; confirmPassword: string }) =>
-      apiFetch<{ reset: boolean }>('/api/auth/reset-password', { method: 'POST', json: input }),
+    async (input: { email: string; otp: string; password: string; confirmPassword: string }) => {
+      if (input.password !== input.confirmPassword) {
+        throw new ApiError('Please correct the highlighted fields.', 422, {
+          confirmPassword: 'Passwords do not match',
+        });
+      }
+
+      // Strength has to be judged before derivation — afterwards it is 44
+      // characters of base64 and unreadable to anyone, this app included.
+      const policy = passwordPolicyError(input.password);
+      if (policy) {
+        throw new ApiError('Please correct the highlighted fields.', 422, { password: policy });
+      }
+
+      return apiFetch<{ reset: boolean }>('/api/auth/reset-password', {
+        method: 'POST',
+        json: {
+          email: input.email,
+          otp: input.otp,
+          password: await derivePasswordProof(input.password, input.email),
+        },
+      });
+    },
   );
 
   async function onRequestCode(event: React.FormEvent) {

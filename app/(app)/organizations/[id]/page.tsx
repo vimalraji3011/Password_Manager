@@ -89,6 +89,7 @@ export default async function OrganizationDetailPage({
           initialSources={sources}
           organizations={allOrganizations}
           role={user?.role ?? 'viewer'}
+          email={user?.email ?? ''}
         />
       </Suspense>
     </div>
